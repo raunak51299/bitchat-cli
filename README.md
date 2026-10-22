@@ -55,6 +55,16 @@ This client validates every event the same way the app does: NIP-01 event id
 recompute, schnorr signature (pure-Python secp256k1 in `secp.py`, tested against
 the official BIP-340 test vectors), client-side `#g` tag filter and dedup.
 
+> **Crypto note:** `secp.py`'s built-in curve code is pure Python — it is
+> **not constant-time** and is deliberately simple (readable over fast). The
+> key it protects is a disposable nickname identity, not a wallet, so this is
+> an accepted trade-off for a hobby CLI. Signatures use fresh per-message aux
+> randomness per BIP-340's recommendation. If `coincurve` (libsecp256k1 —
+> fast and constant-time) is installed, it is used automatically after a
+> self-check; set `SECP_FORCE_PURE_PYTHON=1` to opt out. At the time of
+> writing, `coincurve` has no Python 3.15 wheels yet, so the pure backend is
+> what ships in that venv.
+
 To keep live chat live, the expensive pure-Python signature check runs in
 background workers (the event id is re-checked cheaply inline first), and the
 feed is applied strictly in arrival order — a backlog burst never stalls
@@ -133,7 +143,7 @@ exchanges messages between two CLI peers (two "phones") through real relays.
 | file | purpose |
 |---|---|
 | `bitchat.py` | the CLI client (official internet-mode protocol, DM envelope, TUI) |
-| `secp.py` | pure-Python secp256k1 + BIP-340 (validated on all 19 official vectors) |
+| `secp.py` | pure-Python secp256k1 + BIP-340 (validated on all 19 official vectors; interchangeable constant-time `coincurve` backend when installable) |
 | `nostr_relays.csv` | bundled copy of the app's relay directory (auto-refreshed to `~/.bitchat-cli/`) |
 | `run.bat` | double-click launcher (venv + deps) |
 | `bitchat_custom.py` | previous experimental client (own protocol, kept for reference) |

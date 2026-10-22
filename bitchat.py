@@ -30,6 +30,7 @@ import hashlib
 import hmac
 import json
 import math
+import os
 import random
 import re
 import secrets
@@ -170,6 +171,16 @@ def log(*a):
 
 def sysline(s): log(_c("90", s))
 
+VERBOSE = False                     # set from --verbose in main()
+
+
+def _dbg(msg: str):
+    """Breadcrumb for best-effort (exception-swallowing) paths. Silent
+    unless --verbose; these paths keep the client running on purpose."""
+    if VERBOSE:
+        log(dim("   · " + msg))
+
+
 # ---------------------------------------------------------------- geohash
 _B32 = "0123456789bcdefghjkmnpqrstuvwxyz"
 _B32V = {ch: i for i, ch in enumerate(_B32)}
@@ -303,7 +314,8 @@ class Identity:
         if NOSTR_STATE_FILE.exists():
             try:
                 state = json.loads(NOSTR_STATE_FILE.read_text(encoding="utf-8"))
-            except Exception:
+            except Exception as e:
+                _dbg(f"identity file unreadable, starting fresh: {e}")
                 state = {}
         seed = secrets.token_bytes(32)
         if state.get("seed"):
@@ -311,8 +323,8 @@ class Identity:
                 cand = base64.b64decode(state["seed"])
                 if len(cand) == 32:
                     seed = cand
-            except Exception:
-                pass
+            except Exception as e:
+                _dbg(f"stored seed b64 invalid, new identity: {e}")
         nick = state.get("nick") or ""
         if not nick:
             nick = "anon" + hashlib.sha256(seed + b"nick").hexdigest()[:4]
@@ -320,8 +332,8 @@ class Identity:
                 if LEGACY_FILE.exists():
                     nick = (json.loads(LEGACY_FILE.read_text(encoding="utf-8"))
                             .get("nick") or nick)
-            except Exception:
-                pass
+            except Exception as e:
+                _dbg(f"legacy nick file unread: {e}")
             nick = nick[:MAX_NICK_LEN]
         ident = cls(seed, nick)
         ident.state = state
@@ -674,8 +686,8 @@ def load_settings() -> dict:
                     s[k] = data[k]
             if not isinstance(s.get("relay_cert_fail"), dict):
                 s["relay_cert_fail"] = {}
-    except Exception:
-        pass
+    except Exception as e:
+        _dbg(f"settings unreadable, using defaults: {e}")
     for key, cap in (("relays", 8), ("boost_relays", 5)):
         urls = []
         for u in (s.get(key) or [])[:cap]:
@@ -730,7 +742,8 @@ def load_relay_csv(candidates):
             relays = parse_relay_csv(path.read_text(encoding="utf-8"))
             if relays:
                 return relays
-        except Exception:
+        except Exception as e:
+            _dbg(f"relay csv {path} unusable: {e}")
             continue
     return None
 
@@ -742,14 +755,21 @@ def refresh_relay_csv_quiet():
     try:
         import urllib.request
         req = urllib.request.Request(GEORELAYS_URL,
-                                     headers={"User-Agent": "bitchat-cli"}
-                                     )
-        data = urllib.request.urlopen(req, timeout=8).read()
-        if len(parse_relay_csv(data.decode("utf-8", "replace"))) >= 10:
-            APP_DIR.mkdir(parents=True, exist_ok=True)
-            cache.write_bytes(data)
-    except Exception:
-        pass
+                                     headers={"User-Agent": "bitchat-cli"})
+        with urllib.request.urlopen(req, timeout=8) as resp:
+            data = resp.read()
+        parsed = parse_relay_csv(data.decode("utf-8", "replace"))
+        if len(parsed) < 10:
+            _dbg(f"relay csv refresh: only {len(parsed)} usable rows, "
+                 "keeping cached file")
+            return
+        APP_DIR.mkdir(parents=True, exist_ok=True)
+        tmp = cache.with_suffix(".csv.tmp")
+        tmp.write_bytes(data)
+        os.replace(tmp, cache)            # atomic: concurrent readers never
+                                          # see a half-written csv
+    except Exception as e:
+        _dbg(f"relay csv refresh skipped: {e}")
 
 def relays_closest_to(geohash: str, n: int = N_RELAYS):
     override = SETTINGS.get("relays") or []
@@ -1026,8 +1046,8 @@ class Node:
                 save_settings()
                 self._status(f"relay {host} has a broken certificate - "
                              "avoiding it for 1 hour")
-        except Exception:
-            pass
+        except Exception as e:
+            _dbg(f"cert-fail persist failed: {e}")
 
     async def _subscribe_on(self, ws, backlog: int | None = None,
                             since_ts: int | None = None):
@@ -1041,16 +1061,16 @@ class Node:
                 "since": since_val, "limit": SUB_BACKLOG_LIMIT}
         try:
             await ws.send(json.dumps(["REQ", self.sub_id, filt]))
-        except Exception:
-            pass
+        except Exception as e:
+            _dbg(f"REQ send failed: {e}")
         # DM gift wraps (kind 1059) addressed to this channel's identity
         try:
             dm_filt = {"kinds": [1059], "#p": [self.pubkey_for(gh)],
                        "since": int(time.time()) - SUB_BACKLOG_SINCE,
                        "limit": SUB_BACKLOG_LIMIT}
             await ws.send(json.dumps(["REQ", self.sub_id + "-dm", dm_filt]))
-        except Exception:
-            pass
+        except Exception as e:
+            _dbg(f"dm REQ send failed: {e}")
 
     def _status(self, text):
         if self.verbose:
@@ -1093,8 +1113,9 @@ class Node:
                 ts = int(ev.get("created_at") or 0)
                 if ts > self._last_created.get(url, 0):
                     self._last_created[url] = ts    # reconnect-gap anchor
-            except Exception:
-                pass
+            except (TypeError, ValueError):
+                pass                                # malformed created_at: the
+                                                    # cheap prefilter rejects it
             self._on_event(ev)
         elif typ == "OK" and len(m) >= 3:
             eid, accepted = m[1], bool(m[2])
@@ -1199,8 +1220,8 @@ class Node:
         ok = False
         try:
             ok = bool(fut.result())
-        except Exception:
-            pass
+        except Exception as e:
+            _dbg(f"signature check crashed: {e}")
         self._vready[seq] = self._pending_sig.pop(seq, None) if ok else None
         while self._vseq_apply in self._vready:
             ev = self._vready.pop(self._vseq_apply)
@@ -1226,7 +1247,8 @@ class Node:
         self.participants[pub] = int(ev.get("created_at", 0)) or int(time.time())
         try:
             own = pub == self.pubkey_for(self.geohash)
-        except Exception:
+        except Exception as e:
+            _dbg(f"own-pubkey check failed: {e}")
             own = False
         if own:
             return
@@ -1680,8 +1702,8 @@ class UI:
         try:
             sys.stdout.write("\a")
             sys.stdout.flush()
-        except Exception:
-            pass
+        except (OSError, ValueError, UnicodeEncodeError):
+            pass                            # terminal bells are best-effort
 
     def _mentions_me(self, text: str) -> bool:
         nick = self.node.nick
@@ -1709,7 +1731,8 @@ class UI:
                 self._logf = open(d / f"{gh}.log", "a",
                                   encoding="utf-8", errors="replace")
                 self._log_gh = gh
-            except Exception:
+            except Exception as e:
+                _dbg(f"channel log file unavailable ({gh}): {e}")
                 self._log_ok = False                  # tolerate no-disk cases
                 return
         try:
@@ -1718,15 +1741,16 @@ class UI:
             body = text.replace("\r", " ").replace("\n", " ⏎ ")
             self._logf.write(f"{stamp} {who:<15} {body}\n")
             self._logf.flush()
-        except Exception:
+        except Exception as e:
+            _dbg(f"channel log write failed: {e}")
             self._log_ok = False
 
     def _close_log(self):
         if self._logf:
             try:
                 self._logf.close()
-            except Exception:
-                pass
+            except OSError:
+                pass              # nothing to do: log is being torn down anyway
         self._logf = None
         self._log_gh = None
 
@@ -1821,8 +1845,8 @@ class UI:
             return
         try:
             self._repaint_dot(p["pre"], p["n0"], "32")
-        except Exception:
-            pass
+        except Exception as e:
+            _dbg(f"dot repaint failed: {e}")
 
     @staticmethod
     def _repaint_dot(pre: str, n0: int, color: str):
@@ -2010,7 +2034,6 @@ async def selftest_live() -> list:
 async def run_sniff(gh: str, seconds: float):
     gh = gh.strip().lower()
     urls = relays_closest_to(gh)
-    seed = secrets.token_bytes(32)
     log(f"sniffing #{gh} for {seconds:.0f}s on: "
         f"{', '.join(u.replace('wss://', '') for u in urls)}")
     filt = {"kinds": [KIND_MSG, KIND_PRESENCE], "#g": [gh],
@@ -2035,8 +2058,8 @@ async def run_sniff(gh: str, seconds: float):
                         print(f"[{url.replace('wss://', ''):>26}] {t} k={ev['kind']}"
                               f" nick={nick:<12} pub={ev['pubkey'][:10]} {content!r}",
                               flush=True)
-        except Exception:
-            pass
+        except Exception as e:
+            _dbg(f"sniff {url} lost: {e}")
 
     try:
         await asyncio.wait_for(asyncio.gather(*[one(u) for u in urls],
@@ -2101,8 +2124,8 @@ class TuiChat:
         try:
             sys.stdout.write("\x1b[?1049h\x1b[H\x1b[2J")
             sys.stdout.flush()
-        except Exception:
-            pass
+        except Exception as e:
+            _dbg(f"tui enter failed: {e}")
 
     def close(self):
         if self._task:
@@ -2111,8 +2134,8 @@ class TuiChat:
         try:
             sys.stdout.write("\x1b[0m\x1b[?1049l")
             sys.stdout.flush()
-        except Exception:
-            pass
+        except Exception as e:
+            _dbg(f"tui close failed: {e}")
 
     # ---- renderer ---------------------------------------------------------
     async def _renderer(self):
@@ -2123,8 +2146,8 @@ class TuiChat:
                     self.dirty = False
                     try:
                         self.render()
-                    except Exception:
-                        pass
+                    except Exception as e:
+                        _dbg(f"tui render failed: {e}")
         except asyncio.CancelledError:
             pass
 
@@ -2208,16 +2231,17 @@ class TuiChat:
     def _push(self, line):
         try:
             self.ui.queue.put_nowait(line)
-        except Exception:
-            pass
+        except Exception as e:
+            _dbg(f"typed line dropped ({e})")
 
     def _input_loop(self, loop):
         import msvcrt
         while True:
             try:
                 ch = msvcrt.getwch()
-            except Exception:
-                continue
+            except OSError:
+                continue          # console released; unexpected errors here
+                                  # should surface, not be swallowed
             if ch in ("\x00", "\xe0"):
                 self._handle_key(ch, msvcrt.getwch, loop)
             else:
@@ -2297,6 +2321,9 @@ def main():
                          "history; Home oldest page, End live tail)")
     args = ap.parse_args()
 
+    global VERBOSE
+    VERBOSE = args.verbose
+
     # verify workers do pure-python point math (GIL-bound); short GIL slices
     # keep the asyncio loop responsive while they run
     sys.setswitchinterval(0.001)
@@ -2328,7 +2355,9 @@ def main():
         asyncio.run(run_sniff(args.sniff, args.seconds))
         raise SystemExit(0)
 
-    refresh_relay_csv_quiet()
+    # refresh the relay csv in the background: a fresh/stale-network fetch
+    # must never delay startup, and the response is closed properly
+    threading.Thread(target=refresh_relay_csv_quiet, daemon=True).start()
     ident = Identity.load_or_create()
     if args.nick:
         ident.nick = args.nick.strip()[:MAX_NICK_LEN]

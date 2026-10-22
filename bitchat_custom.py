@@ -41,6 +41,13 @@ except ImportError:
     print("missing dependency — run:  pip install -r requirements.txt", file=sys.stderr)
     sys.exit(1)
 
+
+def _dbg(*a):
+    """Breadcrumbs for best-effort (exception-swallowing) paths; set
+    BITCHAT_DEBUG=1 to see them on stderr."""
+    if os.environ.get("BITCHAT_DEBUG"):
+        print("   ·", *a, file=sys.stderr, flush=True)
+
 if os.name == "nt":
     os.system("")  # enables ANSI escape sequences on legacy Windows consoles
 
@@ -161,7 +168,8 @@ class Identity:
             self.x25_priv = bytes.fromhex(raw["x25_priv"])
             assert len(self.x25_priv) == 32 and len(self.secp_secret) == 32
             return True
-        except Exception:
+        except Exception as e:
+            _dbg("identity load failed, new identity:", type(e).__name__, e)
             return False
 
     def save(self):
@@ -256,7 +264,6 @@ def dm_seal(sender: Identity, recipient_x25_hex: str, text: str):
 
 def dm_open(own_x25_priv: bytes, env: dict):
     """Decrypt a DM envelope. Returns inner dict or None."""
-    from cryptography.hazmat.primitives import serialization
     from cryptography.hazmat.primitives.asymmetric.x25519 import (
         X25519PrivateKey, X25519PublicKey,
     )
@@ -273,9 +280,11 @@ def dm_open(own_x25_priv: bytes, env: dict):
                                inner.get("text", ""))
         sig = bytes.fromhex(inner.get("sig", ""))
         if not secp.verify(bytes.fromhex(inner.get("from", "")), digest, sig):
+            _dbg("dm_open: sender signature failed")
             return None
         return inner
-    except Exception:
+    except Exception as e:
+        _dbg("dm_open decrypt refused:", type(e).__name__, e)
         return None
 
 
@@ -368,8 +377,8 @@ class Node:
         if self.on_relay:
             try:
                 self.on_relay(url, state)
-            except Exception:
-                pass
+            except Exception as e:
+                _dbg(f"on_relay callback failed for {url}: {e}")
 
     async def _relay_loop(self, url: str):
         backoff = 2.0
@@ -435,7 +444,8 @@ class Node:
                 [0, ev["pubkey"], ev["created_at"], ev["kind"], ev["tags"], content],
                 separators=(",", ":"), ensure_ascii=False).encode("utf-8")
             env = json.loads(base64.b64decode(content).decode("utf-8"))
-        except Exception:
+        except Exception as e:
+            _dbg("envelope decode failed:", type(e).__name__, e)
             return
         if not self.no_verify:
             if hashlib.sha256(payload).hexdigest() != ev.get("id"):
@@ -444,7 +454,8 @@ class Node:
                 if not secp.verify(bytes.fromhex(ev["pubkey"]), bytes.fromhex(ev["id"]),
                                    bytes.fromhex(ev.get("sig", ""))):
                     return
-            except Exception:
+            except Exception as e:
+                _dbg("verify crashed:", type(e).__name__, e)
                 return
         if len(self.seen) > 99_999:
             self.seen.clear()
@@ -504,8 +515,8 @@ class UI:
             cfg["channels"] = list(self.joined)
             cfg["relays"] = list(self.node.relay_state)
             CONFIG_FILE.write_text(json.dumps(cfg, indent=2))
-        except OSError:
-            pass
+        except OSError as e:
+            _dbg("config save failed:", e)
 
     # ---- printing ----
     def _c(self, s: str, code: int) -> str:
@@ -877,13 +888,13 @@ async def run_main(args) -> None:
         ui._done = True
         try:
             await asyncio.wait_for(node.stop(), timeout=5)
-        except (asyncio.TimeoutError, asyncio.CancelledError, Exception):
-            pass
+        except (asyncio.TimeoutError, asyncio.CancelledError, Exception) as e:
+            _dbg("node stop:", type(e).__name__, e)
         node_task.cancel()
         try:
             await node_task
-        except (asyncio.CancelledError, Exception):
-            pass
+        except (asyncio.CancelledError, Exception) as e:
+            _dbg("node task end:", type(e).__name__, e)
         ui.save_config()
 
 
@@ -1046,7 +1057,8 @@ def dm_decrypt(own_x25_priv, eph_pub_hex: str, rtag: str, b64_blob: str):
         blob = base64.b64decode(b64_blob)
         nonce, ct = blob[:12], blob[12:]
         return AESGCM(_hkdf(ssk)).decrypt(nonce, ct, rtag.encode())
-    except Exception:
+    except Exception as e:
+        _dbg("dm_decrypt refused:", type(e).__name__, e)
         return None
 
 
@@ -1055,8 +1067,8 @@ def main() -> int:
         try:
             sys.stdout.reconfigure(encoding="utf-8", errors="replace")
             sys.stderr.reconfigure(encoding="utf-8", errors="replace")
-        except Exception:
-            pass
+        except Exception as e:
+            _dbg("stdout reconfigure skipped:", e)
     args = parse_args(sys.argv[1:])
     if args.selftest:
         try:
