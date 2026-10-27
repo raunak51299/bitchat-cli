@@ -52,17 +52,23 @@ block (geohashes of 2/4/5/6/7/8 chars). On the wire:
 * participants expire after 5 minutes of silence (app behavior)
 
 This client validates every event the same way the app does: NIP-01 event id
-recompute, schnorr signature (pure-Python secp256k1 in `secp.py`, tested against
-the official BIP-340 test vectors), client-side `#g` tag filter and dedup.
+recompute, schnorr signature (`secp.py` — OpenSSL-backed secret math, tested
+against the official BIP-340 test vectors), client-side `#g` tag filter and
+dedup.
 
-> **Crypto note:** `secp.py`'s built-in curve code is pure Python — it is
-> **not constant-time** and is deliberately simple (readable over fast). The
-> key it protects is a disposable nickname identity, not a wallet, so this is
-> an accepted trade-off for a hobby CLI. Signatures use fresh per-message aux
-> randomness per BIP-340's recommendation. If `coincurve` (libsecp256k1 —
-> fast and constant-time) is installed, it is used automatically after a
-> self-check; set `SECP_FORCE_PURE_PYTHON=1` to opt out. At the time of
-> writing, `coincurve` has no Python 3.15 wheels yet, so the pure backend is
+> **Crypto note:** `secp.py` validates signatures against the official
+> BIP-340 test vectors on every build. **Secret-scalar math** (public-key
+> derivation, nonce point, DM ECDH) is delegated to OpenSSL via the
+> `cryptography` package, which is constant-time; the non-secret verify
+> math runs in pure Python. The built-in curve code is deliberately simple
+> (readable over fast), and the key it protects is a disposable nickname
+> identity, not a wallet — an accepted trade-off for a hobby CLI.
+> Signatures use fresh per-message aux randomness per BIP-340's
+> recommendation. If `coincurve` (libsecp256k1 — fast and constant-time
+> including verification) is installed, it is used automatically after a
+> self-check; set `SECP_FORCE_PURE_PYTHON=1` to force the all-pure backend
+> (no OpenSSL delegation, no coincurve). At the time of writing,
+> `coincurve` has no Python 3.15 wheels yet, so OpenSSL-backed signing is
 > what ships in that venv.
 
 To keep live chat live, the expensive pure-Python signature check runs in
@@ -143,10 +149,9 @@ exchanges messages between two CLI peers (two "phones") through real relays.
 | file | purpose |
 |---|---|
 | `bitchat.py` | the CLI client (official internet-mode protocol, DM envelope, TUI) |
-| `secp.py` | pure-Python secp256k1 + BIP-340 (validated on all 19 official vectors; interchangeable constant-time `coincurve` backend when installable) |
+| `secp.py` | secp256k1 + BIP-340 — secret-scalar math via OpenSSL, optional constant-time `coincurve` backend (validated on all 19 official vectors) |
 | `nostr_relays.csv` | bundled copy of the app's relay directory (auto-refreshed to `~/.bitchat-cli/`) |
 | `run.bat` | double-click launcher (venv + deps) |
-| `bitchat_custom.py` | previous experimental client (own protocol, kept for reference) |
 
 State lives in `~/.bitchat-cli/`:
 

@@ -2,16 +2,24 @@
 secp256k1 + BIP-340 Schnorr. Enough to make and verify Nostr-compatible
 event signatures.
 
-WARNING (docs): the built-in implementation is PURE PYTHON: it is NOT
-constant-time (double-and-add branches on secret bits, and every affine
-step does a modular inversion) and it is slow. That is an accepted
-trade-off for a hobby CLI: the key involved is a disposable nickname
-identity, never a wallet. For timing-sensitive environments install the
-libsecp256k1-backed `coincurve` package (`pip install coincurve`) - it
-is detected and used automatically when importable and compatible (the
-backend is self-checked at import against this module's pure
-implementation, so any API drift simply disables it instead of breaking
-users). Set SECP_FORCE_PURE_PYTHON=1 to force the pure-python backend.
+Crypto notes (docs):
+- hashing follows BIP-340 exactly; every build is validated against the
+  official test vectors.
+- SECRET-scalar work (public-key derivation, nonce point, DM ECDH) is
+  delegated to OpenSSL through the `cryptography` package, which is
+  constant-time and fast. The curve code below is the pure-python
+  reference/fallback; verification math involves no secret data and
+  therefore stays pure python.
+- WARNING: the pure-python implementation is NOT constant-time (it
+  branches on secret bits when OpenSSL is unavailable) and is slow.
+  Accepted trade-off for a hobby CLI whose key is a disposable nickname
+  identity, never a wallet.
+- if the libsecp256k1-backed `coincurve` package is installed, it is
+  used for signing AND verification after an import-time self-check
+  against this module's implementation (API drift disables it instead
+  of breaking users).
+- set SECP_FORCE_PURE_PYTHON=1 to force the all-pure-python backend
+  (no OpenSSL delegation, no coincurve).
 
 Only used for identity keys / event signing. Message encryption uses
 X25519 + AES-256-GCM from the `cryptography` package.
@@ -19,6 +27,17 @@ X25519 + AES-256-GCM from the `cryptography` package.
 import hashlib
 import os
 import secrets
+
+# environment is read before importing anything optional
+_FORCE_PURE = bool(os.environ.get("SECP_FORCE_PURE_PYTHON"))
+
+_HAS_OPENSSL = True
+try:
+    from cryptography.hazmat.primitives.asymmetric import ec as _ec
+    _CURVE = _ec.SECP256K1()                  # requires cryptography >= 39
+except Exception:                             # ImportError / unsupported
+    _HAS_OPENSSL = False
+_OSSL_ACTIVE = _HAS_OPENSSL and not _FORCE_PURE
 
 # --- curve parameters (secp256k1) -----------------------------------------
 P = 2**256 - 2**32 - 977                # field prime
@@ -52,6 +71,7 @@ def point_add(p1, p2):
 
 
 def point_mul(point, k: int):
+    """Reference (pure) scalar multiplication. Public-data math only."""
     k %= N
     if k == 0:
         return None
@@ -62,6 +82,33 @@ def point_mul(point, k: int):
         addend = point_add(addend, addend)
         k >>= 1
     return result
+
+
+# --- secret-scalar helpers: OpenSSL when available, pure fallback ----------
+def _secret_mul_g(d: int):
+    """d*G for a SECRET scalar d; OpenSSL path is constant-time. Never
+    leaks anything new: the result is the public key by definition."""
+    if _OSSL_ACTIVE:
+        try:
+            nums = _ec.derive_private_key(d, _CURVE).public_key().public_numbers()
+            return (nums.x, nums.y)
+        except Exception:
+            pass                          # documented: fall back to pure python
+    return point_mul(G, d)
+
+
+def _secret_ecdh_x(d: int, point):
+    """x coordinate of d*point for a SECRET scalar d (OpenSSL ECDH)."""
+    if _OSSL_ACTIVE:
+        try:
+            pub = _ec.EllipticCurvePublicNumbers(
+                point[0], point[1], _CURVE).public_key()
+            shared = _ec.derive_private_key(d, _CURVE).exchange(_ec.ECDH(), pub)
+            return int.from_bytes(shared, "big")
+        except Exception:
+            pass                          # documented: fall back to pure python
+    pt = point_mul(point, d)
+    return pt[0] if pt else None
 
 
 def lift_x_parity(xonly: bytes, want_odd: bool):
@@ -90,6 +137,29 @@ def ecdh_compressed(priv32: bytes, peer_xonly: bytes, want_odd: bool):
     d = int.from_bytes(priv32, "big") % N
     if d == 0:
         return None
+    if _OSSL_ACTIVE:
+        # OpenSSL's ECDH only returns x, so recover the original point's y
+        # sign: S + dG must equal d*(peer + G) for the true S.
+        try:
+            x = _secret_ecdh_x(d, peer)
+            other = point_add(peer, G)
+            if other is None:
+                return None
+            x2 = _secret_ecdh_x(d, other)
+            dG = _secret_mul_g(d)         # == our public key (public datum)
+            if x is not None and x2 is not None:
+                for want in (False, True):
+                    c = lift_x_parity(x.to_bytes(32, "big"), want)
+                    if c is None:
+                        continue
+                    s_pt = point_add(c, dG)
+                    if s_pt is not None and s_pt[0] == x2:
+                        y = c[1]
+                        return (0x02 if y % 2 == 0 else 0x03)\
+                            .to_bytes(1, "big") + x.to_bytes(32, "big")
+            # recovery failed: drop through to the pure reference path
+        except Exception:
+            pass                          # documented: fall back to pure python
     pt = point_mul(peer, d)
     if pt is None:
         return None
@@ -115,7 +185,7 @@ def pubkey_xonly(secret32: bytes):
     d = int.from_bytes(secret32, "big")
     if not 1 <= d < N:
         raise ValueError("bad secret key")
-    pt = point_mul(G, d)
+    pt = _secret_mul_g(d)
     assert pt is not None
     x, y = pt
     if y % 2:                              # keep pubkey y even (BIP-340)
@@ -128,11 +198,11 @@ def point_xonly(point) -> bytes:
     return x.to_bytes(32, "big")
 
 
-def _pure_sign(secret32: bytes, msg32: bytes,
-               aux32: bytes = b"\x00" * 32) -> tuple:
-    """Reference BIP-340 sign with an explicit aux (test-vector friendly).
-    Returns (sig, xonly_pubkey, tweaked_secret) so callers can self-verify
-    without recomputing the public key (a full scalar multiplication)."""
+def _core_sign(secret32: bytes, msg32: bytes, aux32: bytes) -> tuple:
+    """BIP-340 sign core. Returns (sig, xonly_pubkey, tweaked_secret) so
+    callers can self-verify without recomputing the public key. The nonce
+    point and the public key are SECRET scalars: constant-time via OpenSSL
+    when available."""
     xonly, d32 = pubkey_xonly(secret32)
     d = int.from_bytes(d32, "big")
     aux = tagged_hash(b"BIP0340/aux", aux32)
@@ -143,7 +213,7 @@ def _pure_sign(secret32: bytes, msg32: bytes,
     k = int.from_bytes(rand, "big") % N
     if k == 0:
         raise ValueError("nonce failed")
-    R = point_mul(G, k)
+    R = _secret_mul_g(k)
     assert R is not None
     if R[1] % 2:
         k = N - k
@@ -156,7 +226,8 @@ def _pure_sign(secret32: bytes, msg32: bytes,
 
 
 def _pure_verify(xonly: bytes, msg: bytes, sig: bytes) -> bool:
-    """Reference BIP-340 verify. sig is 64 bytes (r || s)."""
+    """Reference BIP-340 verify. sig is 64 bytes (r || s). All inputs are
+    public, so pure-python is fine here."""
     Pk = lift_x(xonly)
     if Pk is None:
         return False
@@ -173,9 +244,9 @@ def _pure_verify(xonly: bytes, msg: bytes, sig: bytes) -> bool:
 
 
 # --- optional libsecp256k1 backend (coincurve) -----------------------------
-# Activates only after a runtime self-check against the pure implementation,
-# so API drift across coincurve versions disables it instead of diverging.
-_FORCE_PURE = bool(os.environ.get("SECP_FORCE_PURE_PYTHON"))
+# Activates only after a runtime self-check against this module's own
+# implementation, so API drift across coincurve versions disables it
+# instead of diverging.
 HAVE_COINCURVE = False
 coincurve = None
 
@@ -194,10 +265,10 @@ def _detect_libsecp_backend():
         aux = secrets.token_bytes(32)
         # every direction must agree with this module's own implementation:
         s_cc = schnorr.sign(msg, sk, aux)
-        s_pure, _, _ = _pure_sign(sk, msg, aux)
-        if not (verify(xonly, msg, s_cc) and schnorr.verify(s_pure, msg, xonly)
+        s_core, _, _ = _core_sign(sk, msg, aux)
+        if not (verify(xonly, msg, s_cc) and schnorr.verify(s_core, msg, xonly)
                 and schnorr.verify(s_cc, msg, xonly)
-                and _pure_verify(xonly, msg, s_pure)):
+                and _pure_verify(xonly, msg, s_core)):
             return None
 
         def cc_sign(secret32, msg32, aux32=None):
@@ -221,7 +292,7 @@ if _BACKEND:
 def sign(secret32: bytes, msg32: bytes, aux32: bytes | None = None) -> bytes:
     """BIP-340 sign. msg32 should be the already-hashed message (e.g. event id).
     aux32=None (default) draws fresh randomness, following BIP-340's
-    blinding recommendation for side-channel resistance. Signatures stayed
+    blinding recommendation for side-channel resistance. Signatures stay
     fully valid (and remain reproducible given the same aux)."""
     if aux32 is None:
         aux32 = secrets.token_bytes(32)
@@ -232,8 +303,8 @@ def sign(secret32: bytes, msg32: bytes, aux32: bytes | None = None) -> bytes:
             if verify(xonly, msg32, sig):    # belt & braces, backend self-check
                 return sig
         except Exception:
-            pass                             # documented: fall back to pure python
-    sig, xonly, _ = _pure_sign(secret32, msg32, aux32)
+            pass                             # documented: fall back below
+    sig, xonly, _ = _core_sign(secret32, msg32, aux32)
     if not verify(xonly, msg32, sig):        # belt & braces
         raise ValueError("created signature failed self-verification")
     return sig
@@ -247,7 +318,7 @@ def verify(xonly: bytes, msg: bytes, sig: bytes) -> bool:
         try:
             return _cc_verify(xonly, msg, sig)
         except Exception:
-            pass                             # documented: fall back to pure python
+            pass                             # documented: fall back below
     return _pure_verify(xonly, msg, sig)
 
 
