@@ -1,5 +1,5 @@
 """
-secp256k1 + BIP-340 Schnorr in pure Python (no external deps).
+secp256k1 + BIP-340 Schnorr (secret-scalar math delegated to `cryptography`/OpenSSL).
 Enough to make and verify Nostr-compatible event signatures.
 
 Only used for identity keys / event signing. Message encryption uses

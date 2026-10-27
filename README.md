@@ -133,7 +133,7 @@ exchanges messages between two CLI peers (two "phones") through real relays.
 | file | purpose |
 |---|---|
 | `bitchat.py` | the CLI client (official internet-mode protocol, DM envelope, TUI) |
-| `secp.py` | pure-Python secp256k1 + BIP-340 (validated on all 19 official vectors) |
+| `secp.py` | secp256k1 + BIP-340 (secret-key math via OpenSSL) (validated on all 19 official vectors) |
 | `nostr_relays.csv` | bundled copy of the app's relay directory (auto-refreshed to `~/.bitchat-cli/`) |
 | `run.bat` | double-click launcher (venv + deps) |
 
