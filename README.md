@@ -136,7 +136,6 @@ exchanges messages between two CLI peers (two "phones") through real relays.
 | `secp.py` | pure-Python secp256k1 + BIP-340 (validated on all 19 official vectors) |
 | `nostr_relays.csv` | bundled copy of the app's relay directory (auto-refreshed to `~/.bitchat-cli/`) |
 | `run.bat` | double-click launcher (venv + deps) |
-| `bitchat_custom.py` | previous experimental client (own protocol, kept for reference) |
 
 State lives in `~/.bitchat-cli/`:
 

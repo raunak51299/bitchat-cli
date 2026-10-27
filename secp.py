@@ -8,6 +8,10 @@ X25519 + AES-256-GCM from the `cryptography` package.
 import hashlib
 import secrets
 
+from cryptography.hazmat.primitives.asymmetric import ec
+
+_CURVE = ec.SECP256K1()
+
 # --- curve parameters (secp256k1) -----------------------------------------
 P = 2**256 - 2**32 - 977                # field prime
 N = 0xFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFEBAAEDCE6AF48A03BBFD25E8CD0364141  # order
@@ -53,6 +57,19 @@ def point_mul(point, k: int):
     return result
 
 
+def _secret_mul_g(d: int):
+    """d*G for secret d, via OpenSSL (constant-time, fast)."""
+    nums = ec.derive_private_key(d, _CURVE).public_key().public_numbers()
+    return (nums.x, nums.y)
+
+
+def _secret_ecdh_x(d: int, point) -> int:
+    """x coordinate of d*point for secret d, via OpenSSL."""
+    pub = ec.EllipticCurvePublicNumbers(point[0], point[1], _CURVE).public_key()
+    shared = ec.derive_private_key(d, _CURVE).exchange(ec.ECDH(), pub)
+    return int.from_bytes(shared, "big")
+
+
 def lift_x_parity(xonly: bytes, want_odd: bool):
     """lift_x with a chosen y parity (0x02=even / 0x03=odd prefix semantics).
     bitchat/iOS derives NIP-44 keys from the compressed shared point, i.e. the
@@ -78,25 +95,33 @@ def ecdh_compressed(priv32: bytes, peer_xonly: bytes, want_odd: bool):
     d = int.from_bytes(priv32, "big") % N
     if d == 0:
         return None
-    pt = point_mul(peer, d)
-    if pt is None:
+    # Secret-scalar work is done by OpenSSL; OpenSSL's ECDH only returns x, so
+    # recover y's sign from a second ECDH against peer+G (all public data).
+    other = point_add(peer, G)
+    if other is None:
         return None
-    x, y = pt
+    x = _secret_ecdh_x(d, peer)
+    x2 = _secret_ecdh_x(d, other)
+    dG = _secret_mul_g(d)
+    y = None
+    for cy in _y_candidates(x):
+        s_pt = point_add((x, cy), dG)
+        if s_pt is not None and s_pt[0] == x2:
+            y = cy
+            break
+    if y is None:
+        return None
     return (0x02 if y % 2 == 0 else 0x03).to_bytes(1, "big") + \
         x.to_bytes(32, "big")
 
+def _y_candidates(x: int):
+    y = pow((x * x * x + 7) % P, by, P)
+    return (y, P - y)
+
+
 def lift_x(xonly: bytes):
     """BIP-340 lift_x: the even-y point with the given x coordinate."""
-    x = int.from_bytes(xonly, "big")
-    if x >= P:
-        return None
-    c = (x * x * x + 7) % P
-    y = pow(c, by, P)
-    if (y * y) % P != c:
-        return None
-    if y % 2:
-        y = P - y
-    return (x, y)
+    return lift_x_parity(xonly, False)
 
 
 # --- BIP-340 helpers -------------------------------------------------------
@@ -111,9 +136,7 @@ def pubkey_xonly(secret32: bytes):
     d = int.from_bytes(secret32, "big")
     if not 1 <= d < N:
         raise ValueError("bad secret key")
-    pt = point_mul(G, d)
-    assert pt is not None
-    x, y = pt
+    x, y = _secret_mul_g(d)
     if y % 2:                              # keep pubkey y even (BIP-340)
         d = N - d
     return x.to_bytes(32, "big"), d.to_bytes(32, "big")
@@ -124,12 +147,13 @@ def point_xonly(point) -> bytes:
     return x.to_bytes(32, "big")
 
 
-def sign(secret32: bytes, msg32: bytes, aux32: bytes = b"\x00" * 32) -> bytes:
+def sign(secret32: bytes, msg32: bytes, aux32: bytes = None) -> bytes:
     """BIP-340 sign. msg32 should be the already-hashed message (e.g. event id)."""
+    if aux32 is None:
+        aux32 = secrets.token_bytes(32)    # BIP-340 recommends fresh aux rand
     xonly, d32 = pubkey_xonly(secret32)
     d = int.from_bytes(d32, "big")
-    Pk = point_mul(G, d)
-    assert Pk is not None
+    Pk = lift_x(xonly)
     aux = tagged_hash(b"BIP0340/aux", aux32)
     t = bytes(a ^ b for a, b in zip(d32, aux))
     # NOTE: the nonce hash includes the x-only public key (easy to miss!)
@@ -137,8 +161,7 @@ def sign(secret32: bytes, msg32: bytes, aux32: bytes = b"\x00" * 32) -> bytes:
     k = int.from_bytes(rand, "big") % N
     if k == 0:
         raise ValueError("nonce failed")
-    R = point_mul(G, k)
-    assert R is not None
+    R = _secret_mul_g(k)
     if R[1] % 2:
         k = N - k
     e = int.from_bytes(tagged_hash(

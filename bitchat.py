@@ -744,12 +744,13 @@ def refresh_relay_csv_quiet():
         req = urllib.request.Request(GEORELAYS_URL,
                                      headers={"User-Agent": "bitchat-cli"}
                                      )
-        data = urllib.request.urlopen(req, timeout=8).read()
+        with urllib.request.urlopen(req, timeout=8) as resp:
+            data = resp.read()
         if len(parse_relay_csv(data.decode("utf-8", "replace"))) >= 10:
             APP_DIR.mkdir(parents=True, exist_ok=True)
             cache.write_bytes(data)
-    except Exception:
-        pass
+    except Exception as e:
+        log(f"relay list refresh failed: {type(e).__name__}: {e}")
 
 def relays_closest_to(geohash: str, n: int = N_RELAYS):
     override = SETTINGS.get("relays") or []
@@ -2010,7 +2011,6 @@ async def selftest_live() -> list:
 async def run_sniff(gh: str, seconds: float):
     gh = gh.strip().lower()
     urls = relays_closest_to(gh)
-    seed = secrets.token_bytes(32)
     log(f"sniffing #{gh} for {seconds:.0f}s on: "
         f"{', '.join(u.replace('wss://', '') for u in urls)}")
     filt = {"kinds": [KIND_MSG, KIND_PRESENCE], "#g": [gh],
